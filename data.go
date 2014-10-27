@@ -1,4 +1,4 @@
-package main
+package bgp
 
 import "net"
 
@@ -69,4 +69,13 @@ func EncodeIPv4Prefix(prefix net.IPNet) Prefix {
 	ret := make([]byte, 0, prefixBytes+1)
 	ret = append(ret, byte(prefixLen))
 	return Prefix(append(ret, []byte(prefix.IP.To4())[:prefixBytes]...))
+}
+
+func Notification(code, subcode uint8, data []byte) BGPFrame {
+	buffer := make([]byte, len(data)+2)
+	buffer[0] = code
+	buffer[1] = subcode
+	copy(buffer[2:], data)
+
+	return BGPFrame{Type: NOTIFICATION, Body: buffer}
 }

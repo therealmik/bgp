@@ -1,4 +1,4 @@
-package main
+package bgp
 
 const (
 	OPEN         = 1

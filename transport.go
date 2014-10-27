@@ -1,112 +1,138 @@
-package main
+package bgp
 
 import (
 	"fmt"
 	"net"
+	"time"
 )
+
+type Error string
+
+func (e Error) Error() string {
+	return string(e)
+}
 
 type BGPFrame struct {
 	Type byte
 	Body []byte
 }
 
-func ReadProc(conn net.Conn, ch chan<- BGPFrame) {
+type Connection struct {
+	Conn        net.Conn
+	RecvChannel chan BGPFrame
+	SendChannel chan BGPFrame
+}
+
+func (self *Connection) ReadProc() {
 	header := make([]byte, 19)
 
+ReadLoop:
 	for {
+
 		n := 0
 		for n < 19 {
-			m, err := conn.Read(header[n:19])
+			m, err := self.Conn.Read(header[n:19])
 			if err != nil {
 				fmt.Println("Error reading from peer:", err)
-				close(ch)
-				return
+				break ReadLoop
 			}
 			n += m
 		}
 		length := (int(header[16]) << 8) | int(header[17])
 		if length < 19 || length > 4096 {
 			fmt.Println("Message too long:", length)
-			close(ch)
-			return
+			self.SendChannel <- Notification(1, 1, nil)
+			break ReadLoop
 		}
 
 		length -= 19
 		body := make([]byte, length)
 		n = 0
 		for n < length {
-			m, err := conn.Read(body[n:length])
+			m, err := self.Conn.Read(body[n:length])
 			if err != nil {
 				fmt.Println("Error reading from peer:", err)
-				close(ch)
-				return
+				break ReadLoop
 			}
 			n += m
 		}
-		ch <- BGPFrame{header[18], body}
+		self.RecvChannel <- BGPFrame{header[18], body}
 	}
+	close(self.RecvChannel)
+	self.Conn.Close()
 }
 
-func WriteProc(conn net.Conn, ch <-chan BGPFrame) {
-	buffer := make([]byte, 4096)
+func (self *Connection) Write(frame BGPFrame) error {
+	length := len(frame.Body) + 19
+
+	buffer := make([]byte, length)
 	for i := 0; i < 16; i++ {
 		buffer[i] = 0xff
 	}
 
-	for msg := range ch {
-		length := len(msg.Body) + 19
-		if length > 4096 {
-			fmt.Println("Warning: not attempting to send message > 4096 octets")
-		}
-		if length > 65535 || length < 0 {
-			fmt.Println("Error: cannot send message > 65535 bytes, killing connection!")
-			break
-		}
-		buffer[16] = byte(length >> 8)
-		buffer[17] = byte(length & 0xff)
-		buffer[18] = msg.Type
+	if length > 4096 || length < 0 {
+		return Error("Cannot send message > 4096 octets")
+	}
 
-		copy(buffer[19:], msg.Body)
+	buffer[16] = byte(length >> 8)
+	buffer[17] = byte(length & 0xff)
+	buffer[18] = frame.Type
 
-		n := 0
-		for n < length {
-			m, err := conn.Write(buffer[n:length])
-			if err != nil {
-				fmt.Println("Error writing to peer:", err)
+	copy(buffer[19:], frame.Body)
+
+	n := 0
+	for n < length {
+		m, err := self.Conn.Write(buffer[n:length])
+		if err != nil {
+			return err
+		}
+		n += m
+	}
+
+	return nil
+}
+
+func (self *Connection) WriteProc(keepaliveInterval time.Duration) {
+	keepaliveFrame := BGPFrame{Type: KEEPALIVE, Body: []byte(nil)}
+	self.Write(keepaliveFrame)
+
+	for {
+		timeout := make(chan bool, 1)
+		go func() {
+			time.Sleep(keepaliveInterval)
+			timeout <- true
+		}()
+
+		var err error
+
+		select {
+		case frame, ok := <-self.SendChannel:
+			if !ok {
 				break
 			}
-			n += m
+			err = self.Write(frame)
+			if frame.Type == NOTIFICATION {
+				break
+			}
+		case <-timeout:
+			err = self.Write(keepaliveFrame)
+		}
+		if err != nil {
+			fmt.Println("Error sending message: ", err)
+			break
 		}
 	}
-	conn.Close()
+	self.Conn.Close()
 }
 
-func startTransport(conn net.Conn) (chan BGPFrame, chan BGPFrame) {
-	readCh := make(chan BGPFrame)
-	writeCh := make(chan BGPFrame)
-
-	go ReadProc(conn, readCh)
-	go WriteProc(conn, writeCh)
-
-	return readCh, writeCh
-}
-
-func Neighbor(conn net.Conn, autonomousSystem uint16, holdTime int, bgpIdentifier uint32, optionalParameters []byte) *BGPProc {
-	readCh, writeCh := startTransport(conn)
-
-	writeCh <- EncodeOpen(&OpenMessage{
-		Version:            4,
-		AutonomousSystem:   autonomousSystem,
-		HoldTime:           holdTime,
-		BGPIdentifier:      bgpIdentifier,
-		OptionalParameters: optionalParameters,
-	})
-
-	msg := <-readCh
-	if msg.Type != OPEN {
-		fmt.Println("Got unexpected message type as first message: ", msg.Type)
-		close(writeCh)
-		return
+func NewConnection(conn net.Conn) *Connection {
+	self := &Connection{
+		Conn:        conn,
+		SendChannel: make(chan BGPFrame),
+		RecvChannel: make(chan BGPFrame),
 	}
 
+	go self.ReadProc()
+
+	return self
 }
